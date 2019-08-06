@@ -242,16 +242,9 @@ class PrimitiveModel(ModelDesc):
         return [
                 tf.placeholder(tf.int32, [None,], 'data_idx'),
                 tf.placeholder(tf.float32, [None, config.POINT_NUM , 3], 'points'),
-                tf.placeholder(tf.float32, [None, None, 3], 'bboxes_xyz'),
-                tf.placeholder(tf.float32, [None, None, 3], 'bboxes_lwh'),
-                tf.placeholder(tf.int32, (None, None), 'semantic_labels_input'),
-                tf.placeholder(tf.int32, (None, None), 'heading_labels_input'),
-                tf.placeholder(tf.float32, (None, None), 'heading_residuals_input'),
-                tf.placeholder(tf.int32, (None, None), 'size_labels_input'),
-                tf.placeholder(tf.float32, (None, None, 3), 'size_residuals_input'),
                 ]
 
-    def build_graph(self, _, x, bboxes_xyz, bboxes_lwh, semantic_labels, heading_labels, heading_residuals, size_labels, size_residuals):
+    def build_graph(self, _, x,):
         l0_xyz = x
         l0_points = x
 
@@ -279,30 +272,36 @@ class PrimitiveModel(ModelDesc):
         # B * N * 3
         votes = tf.concat([seeds_xyz, seeds_points], 2) + offset
         votes_xyz = votes[:, :, :3]
+        '''
         dist2center = tf.abs(tf.expand_dims(seeds_xyz, 2) - tf.expand_dims(bboxes_xyz, 1))
         surface_ind = tf.less(dist2center, tf.expand_dims(bboxes_lwh, 1) / 2.)  # B * N * BB * 3, bool
         surface_ind = tf.equal(tf.count_nonzero(surface_ind, -1), 3)  # B * N * BB
         surface_ind = tf.greater_equal(tf.count_nonzero(surface_ind, -1), 1)  # B * N, should be in at least one bbox
+        '''
 
+        '''
         dist2center_norm = tf.norm(dist2center, axis=-1)  # B * N * BB
         votes_assignment = tf.argmin(dist2center_norm, -1, output_type=tf.int32)  # B * N, int
         bboxes_xyz_votes_gt = tf.gather_nd(bboxes_xyz, tf.stack([
             tf.tile(tf.expand_dims(tf.range(tf.shape(votes_assignment)[0]), -1), [1, tf.shape(votes_assignment)[1]]),
             votes_assignment], 2))  # B * N * 3
         vote_reg_loss = tf.reduce_mean(tf.norm(votes_xyz - bboxes_xyz_votes_gt, ord=1, axis=-1) * tf.cast(surface_ind, tf.float32), name='vote_reg_loss')
+        '''
         votes_points = votes[:, :, 3:]
 
         # Proposal Module layers
         # Farthest point sampling on seeds
         proposals_xyz, proposals_output, _ = pointnet_sa_module(votes_xyz, votes_points, npoint=config.PROPOSAL_NUM,
                                                                 radius=0.3, nsample=64, mlp=[128, 128, 128],
-                                                                mlp2=[128, 128, 5+2 * config.NH+4 * config.NS+config.NC],
+                                                                # mlp2=[128, 128, 5+2 * config.NH+4 * config.NS+config.NC],
+                                                                mlp2=[128,128, config.PARA_MUN],
                                                                 group_all=False, scope='proposal',
                                                                 sample_xyz=seeds_xyz)
 
         obj_cls_score = tf.identity(proposals_output[..., :2], 'obj_scores')
-
+        '''
         nms_iou = tf.get_variable('nms_iou', shape=[], initializer=tf.constant_initializer(0.25), trainable=False)
+        '''
         if not get_current_tower_context().is_training:
 
             def get_3d_bbox(box_size, heading_angle, center):
@@ -348,6 +347,7 @@ class PrimitiveModel(ModelDesc):
 
         # calculate positive and negative proposal idxes
         bboxes_xyz_gt = bboxes_xyz  # B * BB * 3
+        '''
         bboxes_labels_gt = semantic_labels  # B * BB
         bboxes_heading_labels_gt = heading_labels
         bboxes_heading_residuals_gt = heading_residuals
@@ -356,7 +356,8 @@ class PrimitiveModel(ModelDesc):
         dist_mat = tf.norm(tf.expand_dims(proposals_xyz, 2) - tf.expand_dims(bboxes_xyz_gt, 1), axis=-1)  # B * PR * BB
         bboxes_assignment = tf.argmin(dist_mat, axis=-1)  # B * PR
         min_dist = tf.reduce_min(dist_mat, axis=-1)
-
+        '''
+        '''
         positive_idxes = tf.where(min_dist < config.POSITIVE_THRES)  # Np * 2
         # with tf.control_dependencies([tf.print(tf.shape(positive_idxes))]):
         negative_idxes = tf.where(min_dist > config.NEGATIVE_THRES)  # Nn * 2
@@ -372,13 +373,15 @@ class PrimitiveModel(ModelDesc):
         obj_correct = tf.concat([tf.cast(tf.nn.in_top_k(pos_obj_cls_score, pos_obj_cls_gt, 1), tf.float32),
                                  tf.cast(tf.nn.in_top_k(neg_obj_cls_score, neg_obj_cls_gt, 1), tf.float32)], axis=0, name='obj_correct')
         obj_accuracy = tf.reduce_mean(obj_correct, name='obj_accuracy')
-
+        '''
+        '''
         # center regression losses
         center_gt = tf.gather_nd(bboxes_xyz_gt, positive_gt_idxes)
         delta_predicted = tf.gather_nd(proposals_output[..., 2:5], positive_idxes)
         delta_gt = center_gt - tf.gather_nd(proposals_xyz, positive_idxes)
         center_loss = tf.reduce_mean(tf.reduce_sum(tf.losses.huber_loss(labels=delta_gt, predictions=delta_predicted, reduction=tf.losses.Reduction.NONE), axis=-1))
-
+        '''
+        '''
         # Appendix A1: chamfer loss, assignment at least one bbox to each gt bbox
         bboxes_assignment_dual = tf.argmin(dist_mat, axis=1)  # B * BB
         batch_idx = tf.tile(tf.expand_dims(tf.range(tf.shape(bboxes_assignment_dual, out_type=tf.int64)[0]), axis=-1), [1, tf.shape(bboxes_assignment_dual)[1]])  # B * BB
@@ -388,7 +391,9 @@ class PrimitiveModel(ModelDesc):
 
         # add up
         center_loss += center_loss_dual
+        '''
 
+        '''
         # Heading loss
         heading_cls_gt = tf.gather_nd(bboxes_heading_labels_gt, positive_gt_idxes)
         heading_cls_score = tf.gather_nd(proposals_output[..., 5:5+config.NH], positive_idxes)
@@ -422,12 +427,15 @@ class PrimitiveModel(ModelDesc):
             name='sem_cls_loss')
         sem_correct = tf.cast(tf.nn.in_top_k(sem_cls_score, sem_cls_gt, 1), tf.float32, name='sem_correct')
         sem_accuracy = tf.reduce_mean(sem_correct, name='sem_accuracy')
+        '''
 
+        '''
         # This will monitor training error & accuracy (in a moving average fashion). The value will be automatically
         # 1. written to tensosrboard
         # 2. written to stat.json
         # 3. printed after each epoch
         summary.add_moving_summary(obj_accuracy, sem_accuracy)
+        '''
 
         # Use a regex to find parameters to apply weight decay.
         # Here we apply a weight decay on all W (weight matrix) of all fc layers
