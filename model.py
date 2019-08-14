@@ -10,7 +10,7 @@ import tensorflow as tf
 from tensorpack import *
 import numpy as np
 from tensorpack.tfutils import get_current_tower_context, gradproc, optimizer, summary, varreplace
-from utils import pointnet_sa_module, pointnet_fp_module
+from utils import pointnet_sa_module, pointnet_fp_module, pts2box
 from dataset import class_mean_size
 from tf_nms3d import NMS3D
 import config
@@ -244,7 +244,7 @@ class PrimitiveModel(ModelDesc):
                 tf.placeholder(tf.float32, [None, config.POINT_NUM , 3], 'points'),
                 ]
 
-    def build_graph(self, _, x,):
+    def build_graph(self, _, x):
         l0_xyz = x
         l0_points = x
 
@@ -294,11 +294,10 @@ class PrimitiveModel(ModelDesc):
         proposals_xyz, proposals_output, _ = pointnet_sa_module(votes_xyz, votes_points, npoint=config.PROPOSAL_NUM,
                                                                 radius=0.3, nsample=64, mlp=[128, 128, 128],
                                                                 # mlp2=[128, 128, 5+2 * config.NH+4 * config.NS+config.NC],
-                                                                mlp2=[128,128, config.PARA_MUN],
+                                                                mlp2=[128, 128, config.PARA_MUN],
                                                                 group_all=False, scope='proposal',
                                                                 sample_xyz=seeds_xyz)
 
-        obj_cls_score = tf.identity(proposals_output[..., :2], 'obj_scores')
         '''
         nms_iou = tf.get_variable('nms_iou', shape=[], initializer=tf.constant_initializer(0.25), trainable=False)
         '''
@@ -444,7 +443,79 @@ class PrimitiveModel(ModelDesc):
         # wd_cost = tf.multiply(1e-5,
         #                       regularize_cost('.*/W', tf.nn.l2_loss),
         #                       name='regularize_loss')
-        total_cost = vote_reg_loss + 0.5 * obj_cls_loss + 1. * box_loss + 0.1 * sem_cls_loss
+
+        ''''
+        # bboxes_xyz(the gt of bounding box center): B * BB * 3 (BB is the num of bounding box)
+        # votes_xys: B * N * 3 (N is the number of votes)
+        # when compare bboxes_xyz and votes_xyz, expand dims to B * N * BB * 3
+        # after expand_dims, become B * 1 * BB * 3, B * N * 1 * 3, Tensorflow will use broadcast
+        # proposals_xyz: B * PR * 3 (PR is the num of proposal)
+        '''
+        # vote_reg_loss
+        # refer to line 61 in model.py when writing these codes
+        # TODO: Here, we use the nearest center as the GT, need to implement the version that using the closest box's
+        #  center as GT
+        vote2proposal_center = tf.abs(tf.expand_dims(votes_xyz, 2) - tf.expand_dims(proposals_xyz, 1))  # B * N * PR * 3
+        vote2proposal_center_norm = tf.norm(vote2proposal_center, axis=-1)  # B * N * PR
+        votes_assignment = tf.argmin(vote2proposal_center_norm, -1, output_type=tf.int32)  # B * N, int
+        votes_gt = tf.gather_nd(proposals_xyz, tf.stack([
+            tf.tile(input=tf.expand_dims(tf.range(tf.shape(votes_assignment)[0]), -1),
+                    multiples=[1, tf.shape(votes_assignment)[1]]),
+            votes_assignment
+        ], 2))  # gather a B * N * 3 tensor from B * PR * 3 according to a B * N(votes_assignment)
+        # the indices will be B * N * 2, indices[b, n] = [b, votes_assignment[b, n]]
+        votes_gt_no_gradient = tf.stop_gradient(votes_gt)
+        vote_reg_loss = tf.reduce_mean(tf.norm(votes_xyz - votes_gt_no_gradient, ord=1, axis=-1), name='vote_reg_loss')
+
+        # obj_cls_loss & box_loss
+        # First decide which box it is fit with for every point
+        '''
+        we assume that the proposals_output is B * PR * 11（2 objectness, 3 xyz, 3 lwh, 3 angles）
+        data_idx is B * P * 3 (P is the number of total points)
+        we want to get pts_assignment of B * P, pts_fit_loss of B * P
+        '''
+        # the rotation angle of each points relative to the proposal boxes
+        alphas_star = -proposals_output[:, :, 8]  # B * PR
+        betas_star = -proposals_output[:, :, 9]  # B * PR
+        gammas_star = -proposals_output[:, :, 10]  # B * PR
+        # referring to https://en.wikipedia.org/wiki/Rotation_matrix#In_three_dimensions
+        # rotation matrix
+        # TODO: When do visualization, the meaning of the angles should be consistent
+        b_pr = alphas_star.shape
+        pr = alphas_star.shape[1]
+        r_alphas = tf.stack([tf.ones(b_pr), tf.zeros(b_pr), tf.zeros(b_pr),
+                             tf.zeros(b_pr), tf.cos(alphas_star), -tf.sin(alphas_star),
+                             tf.zeros(b_pr), tf.sin(alphas_star), tf.cos(alphas_star)], axis=2)
+        r_betas = tf.stack([tf.cos(betas_star), tf.zeros(b_pr), tf.sin(betas_star),
+                            tf.zeros(b_pr), tf.ones(b_pr), tf.zeros(b_pr),
+                            -tf.sin(betas_star), tf.zeros(b_pr), tf.cos(betas_star)], axis=2)
+        r_gammas = tf.stack([tf.cos(gammas_star), -tf.sin(gammas_star), tf.zeros(b_pr),
+                             tf.sin(gammas_star), tf.cos(gammas_star), tf.zeros(b_pr),
+                             tf.zeros(b_pr), tf.zeros(b_pr), tf.ones(b_pr)], axis=2)
+        r_alphas = tf.reshape(r_alphas, shape=[b_pr[0], b_pr[1], 3, 3])
+        r_betas = tf.reshape(r_betas, shape=[b_pr[0], b_pr[1], 3, 3])
+        r_gammas = tf.reshape(r_gammas, shape=[b_pr[0], b_pr[1], 3, 3])
+        r_matrix = tf.linalg.matmul(r_alphas, tf.linalg.matmul(r_betas, r_gammas))  # B * PR * 3 * 3
+        # TODO: handle with the padding points [0, 0 ,0] in data_idx
+        rotated_data_idx = tf.squeeze(tf.linalg.matmul(r_matrix, tf.expand_dims(x, axis=-1)))  # B * P * 3
+        # here, expand dims to make the x be B * P * 3 * 1, we need column vector to do the multiplication, and then
+        # squeeze the additional axis
+        pts_to_box_assignment, pts_to_box_distance = pts2box(rotated_data_idx, proposals_output[:, :, 2:8])
+        # both are B * P & B * P
+        # obj_cls_loss
+        proposal_fit_count = tf.count_nonzero(tf.one_hot(pts_to_box_assignment, depth=pr), axis=1)  # B * PR
+        objectness_gt = tf.math.greater(proposal_fit_count, config.POSITIVE_THRES_NUM)  # B * PR
+        obj_cls_score_gt = tf.one_hot(objectness_gt, depth=2, axis=-1)  # B * PR * 2
+        obj_cls_score = tf.identity(proposals_output[..., :2], 'obj_scores')  # B * PR * 2
+        obj_cls_loss = tf.identity(
+            tf.reduce_min(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=obj_cls_score, labels=obj_cls_score_gt))
+            , name='obj_cls_loss')
+
+        # box_loss
+        # re-assign the points to the positive boxes
+        box_loss = tf.math.reduce_sum(new_pts_to_box_distance)
+        # total_cost = vote_reg_loss + 0.5 * obj_cls_loss + 1. * box_loss + 0.1 * sem_cls_loss
+        total_cost = vote_reg_loss + 0.5 * obj_cls_loss + 1. * box_loss
         total_cost = tf.identity(total_cost, name='total_cost')
         summary.add_moving_summary(total_cost)
 
