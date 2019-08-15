@@ -295,7 +295,7 @@ def pointnet_fp_module(xyz1, xyz2, points1, points2, mlp, scope, bn=True):
 
 
 def pts2box(points, boxes):
-    # getting B * P & B * P from B * P * 3 & B * PR * 6
+    # getting B * P & B * P from B * P * PR * 3 & B * PR * 6
     # TODO: Perhaps add name for debugging
     b = boxes.shape[0]
     p = boxes.shape[1]
@@ -304,9 +304,9 @@ def pts2box(points, boxes):
     box_centers = boxes[:, :, 0:3]  # B * PR * 3
     box_sizes = tf.abs(boxes[:, :, 3:6])  # B * PR * 3  # TODO: here, we allow the negative sizes
     # TODO: Perhaps, broadcasting make us be able to omit the tile
-    points_expand = tf.expand_dims(points, axis=2)  # B * P * 1 * 3
+    # points_expand = tf.expand_dims(points, axis=2)  # B * P * 1 * 3
     centers_expand = tf.expand_dims(box_centers, axis=1)  # B * 1 * PR * 3
-    points_star = tf.abs(points_expand - centers_expand)  # coordinate relative to box center, B * P * PR * 3
+    points_star = tf.abs(points - centers_expand)  # coordinate relative to box center, B * P * PR * 3
     # points_tile = tf.tile(tf.expand_dims(points, axis=2), multiples=[1, 1, pr, 1])
     # centers_tile = tf.tile(tf.expand_dims(box_centers, axis=1), multiples=[1, p, 1, 1])
     # points_star = tf.abs(points_tile - centers_tile)  # coordinate relative to box center, B * P * PR * 3
@@ -327,3 +327,41 @@ def pts2box(points, boxes):
     assignments = tf.math.argmin(all_distances, axis=-1)
     distances = tf.math.reduce_min(all_distances, axis=-1)
     return assignments, distances
+
+
+def pos_pts2box(points, boxes, pos):
+    # getting B * P & B * P from B * P * PR * 3 & B * PR * 6 & B * PR
+    b = boxes.shape[0]
+    p = boxes.shape[1]
+    pr = boxes.shape[1]
+    # get B * P * PR first, and then use argmin
+    box_centers = boxes[:, :, 0:3]  # B * PR * 3
+    box_sizes = tf.abs(boxes[:, :, 3:6])  # B * PR * 3  # TODO: here, we allow the negative sizes
+    # TODO: Perhaps, broadcasting make us be able to omit the tile
+    # points_expand = tf.expand_dims(points, axis=2)  # B * P * 1 * 3
+    centers_expand = tf.expand_dims(box_centers, axis=1)  # B * 1 * PR * 3
+    points_star = tf.abs(points - centers_expand)  # coordinate relative to box center, B * P * PR * 3
+    # points_tile = tf.tile(tf.expand_dims(points, axis=2), multiples=[1, 1, pr, 1])
+    # centers_tile = tf.tile(tf.expand_dims(box_centers, axis=1), multiples=[1, p, 1, 1])
+    # points_star = tf.abs(points_tile - centers_tile)  # coordinate relative to box center, B * P * PR * 3
+    box_sizes_expand = tf.expand_dims(box_sizes, axis=1)  # B * 1 * PR * 3
+    points_inside = tf.math.less(points_star, box_sizes_expand)  # B * P * PR * 3, bool
+    points_inside = tf.math.equal(tf.count_nonzero(points_inside, axis=-1), 3)  # B * P * PR, bool, True for inside
+    points_inside = tf.dtypes.cast(points_inside, dtype=tf.float32)  # B * P * PR, float32
+    # distance if inside
+    distance_in_xyz = points_star + box_sizes_expand  # B * P * PR * 3
+    min_d_inside = tf.math.reduce_min(distance_in_xyz, axis=-1)  # B * P * PR
+    # distance if outside
+    min_d_outside = tf.math.maximum(points_star - box_sizes_expand, tf.zeros([b, p, pr, 3]))  # B * P * PR * 3
+    min_d_outside = tf.math.sqrt(tf.reduce_sum(tf.math.square(min_d_outside), axis=-1))  # B * P * PR
+    # all_distance:  B * P * PR
+    all_distances = tf.multiply(points_inside, min_d_inside) + tf.multiply(1 - points_inside, min_d_outside)
+
+    # use argmin and min to get assignments and distances
+    # pos is B * PR, all_distance is B * P * PR,
+    pos_broadcast = tf.broadcast_to(tf.expand_dims(pos, axis=1), shape=[b, p, pr])
+    pos_distance = tf.where(condition=pos_broadcast, x=all_distances,
+                            y=tf.constant(value=float('inf'), dtype=tf.float32, shape=[b, p, pr]))
+    distances = tf.math.reduce_min(pos_distance, axis=-1)
+    return distances
+

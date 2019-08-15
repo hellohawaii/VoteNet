@@ -10,7 +10,7 @@ import tensorflow as tf
 from tensorpack import *
 import numpy as np
 from tensorpack.tfutils import get_current_tower_context, gradproc, optimizer, summary, varreplace
-from utils import pointnet_sa_module, pointnet_fp_module, pts2box
+from utils import pointnet_sa_module, pointnet_fp_module, pts2box, pos_pts2box
 from dataset import class_mean_size
 from tf_nms3d import NMS3D
 import config
@@ -483,6 +483,7 @@ class PrimitiveModel(ModelDesc):
         # TODO: When do visualization, the meaning of the angles should be consistent
         b_pr = alphas_star.shape
         pr = alphas_star.shape[1]
+        p = x.shape[1]
         r_alphas = tf.stack([tf.ones(b_pr), tf.zeros(b_pr), tf.zeros(b_pr),
                              tf.zeros(b_pr), tf.cos(alphas_star), -tf.sin(alphas_star),
                              tf.zeros(b_pr), tf.sin(alphas_star), tf.cos(alphas_star)], axis=2)
@@ -496,24 +497,32 @@ class PrimitiveModel(ModelDesc):
         r_betas = tf.reshape(r_betas, shape=[b_pr[0], b_pr[1], 3, 3])
         r_gammas = tf.reshape(r_gammas, shape=[b_pr[0], b_pr[1], 3, 3])
         r_matrix = tf.linalg.matmul(r_alphas, tf.linalg.matmul(r_betas, r_gammas))  # B * PR * 3 * 3
-        # TODO: handle with the padding points [0, 0 ,0] in data_idx
-        rotated_data_idx = tf.squeeze(tf.linalg.matmul(r_matrix, tf.expand_dims(x, axis=-1)))  # B * P * 3
-        # here, expand dims to make the x be B * P * 3 * 1, we need column vector to do the multiplication, and then
-        # squeeze the additional axis
+        r_matrix_expand = tf.expand_dims(r_matrix, axis=1)  # B * 1 * PR * 3 * 3
+        r_matrix_tile = tf.tile(r_matrix_expand, multiples=[1, p, 1, 1, 1])  # B * P * PR * 3 * 3
+        x_expand = tf.expand_dims(tf.expand_dims(x, axis=2), axis=-1)  # B * P * 1 * 3 * 1 from B * P * 3
+        # here, we need column vector to do the multiplication,
+        x_tile = tf.tile(x_expand, multiples=[1, 1, pr, 1, 1])  # B * P * PR * 3 * 1
+        rotated_data_idx = tf.squeeze(tf.linalg.matmul(r_matrix_tile, x_tile))  # B * P * PR * 3
+        # squeeze the additional axis to get the position tensor
         pts_to_box_assignment, pts_to_box_distance = pts2box(rotated_data_idx, proposals_output[:, :, 2:8])
         # both are B * P & B * P
         # obj_cls_loss
-        proposal_fit_count = tf.count_nonzero(tf.one_hot(pts_to_box_assignment, depth=pr), axis=1)  # B * PR
-        objectness_gt = tf.math.greater(proposal_fit_count, config.POSITIVE_THRES_NUM)  # B * PR
-        obj_cls_score_gt = tf.one_hot(objectness_gt, depth=2, axis=-1)  # B * PR * 2
+        # abandon the point at the origin
+        origin_index = tf.equal(tf.count_nonzero(x, axis=-1), 3)  # B * P, origin point will be 1
+        is_not_origin = tf.tile(tf.expand_dims(1-tf.cast(origin_index, dtype=tf.float32), axis=-1),
+                                multiples=[1, 1, pr])  # B * P * PR
+        proposal_fit_count = tf.count_nonzero(tf.math.multiply(tf.one_hot(pts_to_box_assignment, depth=pr),
+                                                               is_not_origin), axis=1)  # B * PR
+        obj_gt = tf.math.greater(proposal_fit_count, config.POSITIVE_THRES_NUM)  # B * PR, 1 or positive
+        obj_cls_score_gt = tf.one_hot(obj_gt, depth=2, axis=-1)  # B * PR * 2
         obj_cls_score = tf.identity(proposals_output[..., :2], 'obj_scores')  # B * PR * 2
         obj_cls_loss = tf.identity(
             tf.reduce_min(tf.nn.sparse_softmax_cross_entropy_with_logits(logits=obj_cls_score, labels=obj_cls_score_gt))
             , name='obj_cls_loss')
 
         # box_loss
-        # re-assign the points to the positive boxes
-        box_loss = tf.math.reduce_sum(new_pts_to_box_distance)
+        pos_pts_to_box_distance = pos_pts2box(rotated_data_idx, proposals_output[:, :, 2:8], obj_gt)
+        box_loss = tf.math.reduce_sum(tf.math.multiply(pos_pts_to_box_distance, 1-origin_index))
         # total_cost = vote_reg_loss + 0.5 * obj_cls_loss + 1. * box_loss + 0.1 * sem_cls_loss
         total_cost = vote_reg_loss + 0.5 * obj_cls_loss + 1. * box_loss
         total_cost = tf.identity(total_cost, name='total_cost')
